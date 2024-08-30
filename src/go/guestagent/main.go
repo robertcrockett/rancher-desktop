@@ -52,21 +52,39 @@ var (
 	containerdSock   = flag.String("containerdSock",
 		containerdSocketFile,
 		"file path for Containerd socket address")
-	k8sServiceListenerAddr = flag.String("k8sServiceListenerAddr", net.IPv4zero.String(),
+	vtunnelAddr             = flag.String("vtunnelAddr", vtunnelPeerAddr, "peer address for Vtunnel in IP:PORT format")
+	enablePrivilegedService = flag.Bool("privilegedService", false, "enable Privileged Service mode")
+	k8sServiceListenerAddr  = flag.String("k8sServiceListenerAddr", net.IPv4zero.String(),
 		"address to bind Kubernetes services to on the host, valid options are 0.0.0.0 or 127.0.0.1")
 	adminInstall = flag.Bool("adminInstall", false, "indicates if Rancher Desktop is installed as admin or not")
 	k8sAPIPort   = flag.String("k8sAPIPort", "6443",
 		"K8sAPI port number to forward to rancher-desktop wsl-proxy as a static portMapping event")
-	tapIfaceIP = flag.String("tap-interface-ip", "192.168.127.2",
-		"IP address for the tap interface eth0 in network namespace")
 )
 
+// Flags can only be enabled in the following combination:
+// +======================+==============================================+
+// |                      |     Default Network    | Namespaced Network  |
+// +----------------------+------------------------+---------------------+
+// |                      | Admin      | Non-Admin | Admin   | Non-Admin |
+// +======================+============+===========+=========+===========+
+// | privilegedService    | enable     | disable   | disable | disable   |
+// +----------------------+------------+-----------+---------+-----------+
+// | docker Or containerd | enable     | disable   | enable  | enable    |
+// +----------------------+------------+-----------+---------+-----------+
+// | iptables             | disable or | enable    | disable | disable   |
+// |                      | **enable   |           |         |           |
+// +----------------------+------------+-----------+---------+-----------+
+// ** iptables can be enable for the default network with admin when older
+// versions of k8s are used that do not support the service watcher API.
+
 const (
+	wslInfName             = "eth0"
 	iptablesUpdateInterval = 3 * time.Second
 	socketInterval         = 5 * time.Second
 	socketRetryTimeout     = 2 * time.Minute
 	dockerSocketFile       = "/var/run/docker.sock"
 	containerdSocketFile   = "/run/k3s/containerd/containerd.sock"
+	vtunnelPeerAddr        = "127.0.0.1:3040"
 )
 
 func main() {
@@ -113,38 +131,52 @@ func main() {
 
 	var portTracker tracker.Tracker
 
-	forwarder := forwarder.NewWSLProxyForwarder("/run/wsl-proxy.sock")
-	portTracker = tracker.NewAPITracker(forwarder, tracker.GatewayBaseURL, *tapIfaceIP, *adminInstall)
-	// Manually register the port for K8s API, we would
-	// only want to send this manual port mapping if both
-	// of the following conditions are met:
-	// 1) if kubernetes is enabled
-	// 2) when wsl-proxy for wsl-integration is enabled
-	if *enableKubernetes {
-		port, err := nat.NewPort("tcp", *k8sAPIPort)
-		if err != nil {
-			log.Fatalf("failed to parse port for k8s API: %v", err)
+	if *enablePrivilegedService {
+		if *vtunnelAddr == "" {
+			log.Fatal("-vtunnelAddr must be provided when -privilegedService is enabled.")
 		}
-		k8sAPIPortMapping := types.PortMapping{
-			Remove: false,
-			Ports: nat.PortMap{
-				port: []nat.PortBinding{
-					{
-						HostIP:   "127.0.0.1",
-						HostPort: *k8sAPIPort,
+
+		wslAddr, err := getWSLAddr(wslInfName)
+		if err != nil {
+			log.Fatalf("failure getting WSL IP addresses: %v", err)
+		}
+
+		forwarder := forwarder.NewVTunnelForwarder(*vtunnelAddr)
+		portTracker = tracker.NewVTunnelTracker(forwarder, wslAddr)
+	} else {
+		forwarder := forwarder.NewWSLProxyForwarder("/run/wsl-proxy.sock")
+		portTracker = tracker.NewAPITracker(forwarder, tracker.GatewayBaseURL, *adminInstall)
+		// Manually register the port for K8s API, we would
+		// only want to send this manual port mapping if both
+		// of the following conditions are met:
+		// 1) if kubernetes is enabled
+		// 2) when wsl-proxy for wsl-integration is enabled
+		if *enableKubernetes {
+			port, err := nat.NewPort("tcp", *k8sAPIPort)
+			if err != nil {
+				log.Fatalf("failed to parse port for k8s API: %v", err)
+			}
+			k8sAPIPortMapping := types.PortMapping{
+				Remove: false,
+				Ports: nat.PortMap{
+					port: []nat.PortBinding{
+						{
+							HostIP:   "127.0.0.1",
+							HostPort: *k8sAPIPort,
+						},
 					},
 				},
-			},
+			}
+			if err := forwarder.Send(k8sAPIPortMapping); err != nil {
+				log.Fatalf("failed to send a static portMapping event to wsl-proxy: %v", err)
+			}
+			log.Debugf("successfully forwarded k8s API port [%s] to wsl-proxy", *k8sAPIPort)
 		}
-		if err := forwarder.Send(k8sAPIPortMapping); err != nil {
-			log.Fatalf("failed to send a static portMapping event to wsl-proxy: %v", err)
-		}
-		log.Debugf("successfully forwarded k8s API port [%s] to wsl-proxy", *k8sAPIPort)
 	}
 
 	if *enableContainerd {
 		group.Go(func() error {
-			eventMonitor, err := containerd.NewEventMonitor(*containerdSock, portTracker)
+			eventMonitor, err := containerd.NewEventMonitor(*containerdSock, portTracker, *enablePrivilegedService)
 			if err != nil {
 				return fmt.Errorf("error initializing containerd event monitor: %w", err)
 			}
@@ -188,7 +220,7 @@ func main() {
 			// of the legacy network, requiring listeners only. In listenerOnlyMode, we create
 			// TCP listeners on 127.0.0.1 to enable automatic port forwarding mechanisms,
 			// particularly in WSLv2 environments.
-			listenerOnlyMode := *enableIptables && !*adminInstall
+			listenerOnlyMode := *enableIptables && !*enablePrivilegedService && !*adminInstall
 			// Watch for kube
 			err := kube.WatchForServices(ctx,
 				*configPath,
@@ -248,4 +280,29 @@ func tryConnectAPI(ctx context.Context, socketFile string, verify func(context.C
 			return nil
 		}
 	}
+}
+
+// Gets the wsl interface address by doing a lookup by name
+// for wsl we do a lookup for 'eth0'.
+func getWSLAddr(infName string) ([]types.ConnectAddrs, error) {
+	inf, err := net.InterfaceByName(infName)
+	if err != nil {
+		return nil, err
+	}
+
+	addrs, err := inf.Addrs()
+	if err != nil {
+		return nil, err
+	}
+
+	connectAddrs := make([]types.ConnectAddrs, 0)
+
+	for _, addr := range addrs {
+		connectAddrs = append(connectAddrs, types.ConnectAddrs{
+			Network: addr.Network(),
+			Addr:    addr.String(),
+		})
+	}
+
+	return connectAddrs, nil
 }

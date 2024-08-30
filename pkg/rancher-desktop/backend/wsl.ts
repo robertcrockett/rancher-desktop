@@ -37,6 +37,7 @@ import SERVICE_GUEST_AGENT_INIT from '@pkg/assets/scripts/rancher-desktop-guesta
 import SERVICE_SCRIPT_CRI_DOCKERD from '@pkg/assets/scripts/service-cri-dockerd.initd';
 import SERVICE_SCRIPT_HOST_RESOLVER from '@pkg/assets/scripts/service-host-resolver.initd';
 import SERVICE_SCRIPT_K3S from '@pkg/assets/scripts/service-k3s.initd';
+import SERVICE_VTUNNEL_PEER from '@pkg/assets/scripts/service-vtunnel-peer.initd';
 import SERVICE_SCRIPT_DOCKERD from '@pkg/assets/scripts/service-wsl-dockerd.initd';
 import SCRIPT_DATA_WSL_CONF from '@pkg/assets/scripts/wsl-data.conf';
 import WSL_EXEC from '@pkg/assets/scripts/wsl-exec';
@@ -45,6 +46,7 @@ import WSL_INIT_RD_NETWORKING_SCRIPT from '@pkg/assets/scripts/wsl-init-rd-netwo
 import { ContainerEngine } from '@pkg/config/settings';
 import { getServerCredentialsPath, ServerState } from '@pkg/main/credentialServer/httpCredentialHelperServer';
 import mainEvents from '@pkg/main/mainEvents';
+import { getVtunnelInstance, getVtunnelConfigPath } from '@pkg/main/networking/vtunnel';
 import BackgroundProcess from '@pkg/utils/backgroundProcess';
 import * as childProcess from '@pkg/utils/childProcess';
 import clone from '@pkg/utils/clone';
@@ -115,8 +117,8 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
 
         if (this.cfg?.kubernetes.enabled) {
           const k8sPort = 6443;
-          const eth0IP = '192.168.127.2';
-          const k8sPortForwarding = `127.0.0.1:${ k8sPort }=${ eth0IP }:${ k8sPort }`;
+          const gatewayIP = '192.168.127.2';
+          const k8sPortForwarding = `127.0.0.1:${ k8sPort }=${ gatewayIP }:${ k8sPort }`;
 
           args.push('--port-forward', k8sPortForwarding);
         }
@@ -144,6 +146,18 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
       },
       shouldRun: () => Promise.resolve([State.STARTING, State.STARTED, State.DISABLED].includes(this.state)),
     });
+
+    if (!this.cfg?.experimental.virtualMachine.networkingTunnel) {
+      // Register a new tunnel for RD Guest Agent
+      this.vtun.addTunnel({
+        name:                  'Rancher Desktop Privileged Service',
+        handshakePort:         17382,
+        vsockHostPort:         17381,
+        peerAddress:           '127.0.0.1',
+        peerPort:              3040,
+        upstreamServerAddress: 'npipe:////./pipe/rancher_desktop/privileged_service',
+      });
+    }
 
     this.kubeBackend = kubeFactory(this);
   }
@@ -184,6 +198,9 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
 
     return this.#isAdminInstall;
   }
+
+  /** Indicates whether privileged service is enabled in the current installation. */
+  protected privilegedServiceEnabled = false;
 
   /**
    * Reference to the _init_ process in WSL.  All other processes should be
@@ -226,6 +243,9 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
   set noModalDialogs(value: boolean) {
     this.#noModalDialogs = value;
   }
+
+  /** Vtunnel Proxy management singleton. */
+  protected vtun = getVtunnelInstance();
 
   /**
    * The current operation underway; used to avoid responding to state changes
@@ -481,8 +501,9 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
    * contents from the data distribution.
    */
   protected async writeHostsFile(config: BackendSettings) {
-    const virtualNetworkStaticAddr = '192.168.127.254';
-    const virtualNetworkGatewayAddr = '192.168.127.1';
+    const rdNetworking = config.experimental.virtualMachine.networkingTunnel;
+    const virtualNetworkHostAddr = '192.168.127.254';
+    const hostIPAddr = rdNetworking ? virtualNetworkHostAddr : wslHostIPv4Address();
 
     await this.progressTracker.action('Updating /etc/hosts', 50, async() => {
       const contents = await fs.promises.readFile(`\\\\wsl$\\${ DATA_INSTANCE_NAME }\\etc\\hosts`, 'utf-8');
@@ -491,14 +512,31 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
       const hosts = ['host.rancher-desktop.internal', 'host.docker.internal'];
       const extra = [
         '# BEGIN Rancher Desktop configuration.',
-        `${ virtualNetworkStaticAddr } ${ hosts.join(' ') }`,
-        `${ virtualNetworkGatewayAddr } gateway.rancher-desktop.internal`,
+        `${ hostIPAddr } ${ hosts.join(' ') }`,
         '# END Rancher Desktop configuration.',
       ].map(l => `${ l }\n`).join('');
 
       await fs.promises.writeFile(`\\\\wsl$\\${ INSTANCE_NAME }\\etc\\hosts`,
         lines.join('\n') + extra, 'utf-8');
     });
+  }
+
+  /**
+   * start/stop Privileged Service based on a given command [start|stop],
+   * also, it returns a boolean to indicate if privileged services
+   * is enabled.
+   */
+  protected async invokePrivilegedService(cmd: 'start' | 'stop'): Promise<boolean> {
+    const privilegedServicePath = path.join(paths.resources, 'win32', 'internal', 'privileged-service.exe');
+    let privilegedServiceEnabled = true;
+
+    try {
+      await childProcess.spawnFile(privilegedServicePath, [cmd]);
+    } catch (error) {
+      privilegedServiceEnabled = false;
+    }
+
+    return privilegedServiceEnabled;
   }
 
   /**
@@ -769,17 +807,42 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
     const credsPath = getServerCredentialsPath();
 
     try {
-      const credentialServerAddr = 'host.rancher-desktop.internal:6109';
+      const vtunnelPeerServerAddr = '127.0.0.1:3030';
+      const credentialServerAddr = '192.168.127.254:6109';
+      // When networkTunnel is enabled we talk directly to the host which is assigned
+      // with 192.168.127.254 static address. Otherwise, we talk to the vtunnel peer
+      // which is listening in the WSL VM on 127.0.0.1:3030.
+      const credForwarderURL = this.cfg?.experimental.virtualMachine.networkingTunnel ? credentialServerAddr : vtunnelPeerServerAddr;
       const stateInfo: ServerState = JSON.parse(await fs.promises.readFile(credsPath, { encoding: 'utf-8' }));
       const escapedPassword = stateInfo.password.replace(/\\/g, '\\\\')
         .replace(/'/g, "\\'");
       // leading `$` is needed to escape single-quotes, as : $'abc\'xyz'
       const leadingDollarSign = stateInfo.password.includes("'") ? '$' : '';
       const fileContents = `CREDFWD_AUTH=${ leadingDollarSign }'${ stateInfo.user }:${ escapedPassword }'
-      CREDFWD_URL='http://${ credentialServerAddr }'
+      CREDFWD_URL='http://${ credForwarderURL }'
       `;
       const defaultConfig = { credsStore: 'rancher-desktop' };
       let existingConfig: Record<string, any>;
+
+      const OldCredHelperService = '/etc/init.d/credhelper-vtunnel-peer';
+      const OldCredHelperConfd = '/etc/conf.d/credhelper-vtunnel-peer';
+
+      await this.handleUpgrade([OldCredHelperService, OldCredHelperConfd]);
+
+      await this.writeFile('/etc/init.d/vtunnel-peer', SERVICE_VTUNNEL_PEER, 0o755);
+      await this.writeConf('vtunnel-peer', {
+        VTUNNEL_PEER_BINARY: await this.getVtunnelPeerPath(),
+        LOG_DIR:             await this.wslify(paths.logs),
+        CONFIG_PATH:         await this.wslify(getVtunnelConfigPath()),
+      });
+      await this.execCommand('/sbin/rc-update', 'add', 'vtunnel-peer', 'default');
+
+      // Stop the service if RD Networking is enabled. We need to add it
+      // first as rc-service del … fails if the service is not enabled,
+      // but rc-service add … handles an already-enabled service fine.
+      if (this.cfg?.experimental.virtualMachine.networkingTunnel) {
+        await this.execCommand('/sbin/rc-update', 'del', 'vtunnel-peer', 'default');
+      }
 
       await this.execCommand('mkdir', '-p', ETC_RANCHER_DESKTOP_DIR);
       await this.writeFile(CREDENTIAL_FORWARDER_SETTINGS_PATH, fileContents, 0o644);
@@ -846,14 +909,15 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
     const isAdminInstall = await this.getIsAdminInstall();
 
     const guestAgentConfig: Record<string, string> = {
-      LOG_DIR:                  await this.wslify(paths.logs),
-      GUESTAGENT_ADMIN_INSTALL: isAdminInstall ? 'true' : 'false',
-      GUESTAGENT_KUBERNETES:    enableKubernetes ? 'true' : 'false',
-      GUESTAGENT_IPTABLES:      iptables.toString(), // only enable IPTABLES for older K8s
-      GUESTAGENT_CONTAINERD:    cfg?.containerEngine.name === ContainerEngine.CONTAINERD ? 'true' : 'false',
-      GUESTAGENT_DOCKER:        cfg?.containerEngine.name === ContainerEngine.MOBY ? 'true' : 'false',
-      GUESTAGENT_DEBUG:         this.debug ? 'true' : 'false',
-      GUESTAGENT_K8S_SVC_ADDR:  isAdminInstall && !cfg?.kubernetes.ingress.localhostOnly ? '0.0.0.0' : '127.0.0.1',
+      LOG_DIR:                       await this.wslify(paths.logs),
+      GUESTAGENT_ADMIN_INSTALL:      isAdminInstall ? 'true' : 'false',
+      GUESTAGENT_KUBERNETES:         enableKubernetes ? 'true' : 'false',
+      GUESTAGENT_IPTABLES:           iptables.toString(), // only enable IPTABLES for older K8s
+      GUESTAGENT_PRIVILEGED_SERVICE: this.privilegedServiceEnabled ? 'true' : 'false',
+      GUESTAGENT_CONTAINERD:         cfg?.containerEngine.name === ContainerEngine.CONTAINERD ? 'true' : 'false',
+      GUESTAGENT_DOCKER:             cfg?.containerEngine.name === ContainerEngine.MOBY ? 'true' : 'false',
+      GUESTAGENT_DEBUG:              this.debug ? 'true' : 'false',
+      GUESTAGENT_K8S_SVC_ADDR:       isAdminInstall && !cfg?.kubernetes.ingress.localhostOnly ? '0.0.0.0' : '127.0.0.1',
     };
 
     await Promise.all([
@@ -1265,6 +1329,14 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
           await this.writeResolvConf();
         })()];
 
+        const rdNetworking = !!config?.experimental.virtualMachine.networkingTunnel;
+
+        this.privilegedServiceEnabled = rdNetworking ? false : await this.invokePrivilegedService('start');
+
+        if (!rdNetworking) {
+          await this.vtun.start();
+        }
+
         if (config.kubernetes.enabled) {
           prepActions.push((async() => {
             [kubernetesVersion] = await this.kubeBackend.download(config);
@@ -1294,7 +1366,7 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
         try {
           await this.progressTracker.action('Installing container engine', 0, Promise.all([
             this.progressTracker.action('Starting WSL environment', 100, async() => {
-              const rdNetworkingDNS = 'gateway.rancher-desktop.internal';
+              const rdNetworkingDNS = '192.168.127.1';
               const logPath = await this.wslify(paths.logs);
               const rotateConf = LOGROTATE_K3S_SCRIPT.replace(/\r/g, '')
                 .replace('/var/log', logPath);
@@ -1406,8 +1478,6 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
                   await this.execCommand({ root: true }, 'rm', '-f', obsoleteImageAllowListConf);
                 }),
                 await this.progressTracker.action('Rancher Desktop guest agent', 50, this.installGuestAgent(kubernetesVersion, this.cfg)),
-                // Remove any residual rc artifacts from previous versions when vtunnel was installed
-                await this.execCommand({ root: true }, 'rm', '-f', '/etc/init.d/vtunnel-peer', '/etc/runlevels/default/vtunnel-peer'),
               ]);
 
               await this.writeFile('/usr/local/bin/wsl-exec', WSL_EXEC, 0o755);
@@ -1420,8 +1490,10 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
                   // just ignore any errors; all the script does is installing spin plugins and templates
                 }
               }
-              // Do not await on this, as we don't want to wait until the proxy exits.
-              this.runWslProxy().catch(console.error);
+              if (rdNetworking) {
+                // Do not await on this, as we don't want to wait until the proxy exits.
+                this.runWslProxy().catch(console.error);
+              }
             }),
             this.progressTracker.action('Installing CA certificates', 100, this.installCACerts()),
             this.progressTracker.action('Installing helpers', 50, this.installWSLHelpers()),
@@ -1448,13 +1520,10 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
                 // Make sure the apiserver can be accessed from WSL through the internal gateway
                 k3sConf.ADDITIONAL_ARGS += ' --tls-san gateway.rancher-desktop.internal';
 
-                // Generate certificates for the statically defined host entries.
-                // This is useful for users connecting to the host via HTTPS.
-                k3sConf.ADDITIONAL_ARGS += ' --tls-san host.rancher-desktop.internal';
-                k3sConf.ADDITIONAL_ARGS += ' --tls-san host.docker.internal';
-
+                if (rdNetworking) {
                 // Add the `veth-rd1` IP address from inside the namespace
-                k3sConf.ADDITIONAL_ARGS += ' --tls-san 192.168.1.2';
+                  k3sConf.ADDITIONAL_ARGS += ' --tls-san 192.168.1.2';
+                }
 
                 if (!config.kubernetes.options.flannel) {
                   console.log(`Disabling flannel and network policy`);
@@ -1662,7 +1731,9 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
           }
         }
         if (!this.cfg?.experimental.virtualMachine.networkingTunnel) {
+          await this.vtun.stop();
           await this.resolverHostProcess.stop();
+          await this.invokePrivilegedService('stop');
         }
         const initProcess = this.process;
 
@@ -1748,6 +1819,16 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
     // just get WSL to do the transformation for us.
 
     return this.wslify(executable('wsl-helper-linux'), distro);
+  }
+
+  /**
+   * Return the Linux path to the vtunnel peer executable.
+   */
+  protected getVtunnelPeerPath(): Promise<string> {
+    // We need to get the Linux path to our helper executable; it is easier to
+    // just get WSL to do the transformation for us.
+
+    return this.wslify(path.join(paths.resources, 'linux', 'internal', 'vtunnel'));
   }
 
   async getFailureDetails(exception: any): Promise<FailureDetails> {
