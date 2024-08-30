@@ -23,7 +23,6 @@ import (
 	"github.com/containers/gvisor-tap-vsock/pkg/types"
 	"github.com/docker/go-connections/nat"
 	"github.com/rancher-sandbox/rancher-desktop/src/go/guestagent/pkg/tracker"
-	guestagentType "github.com/rancher-sandbox/rancher-desktop/src/go/guestagent/pkg/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -55,7 +54,7 @@ func TestBasicAdd(t *testing.T) {
 	defer testSrv.Close()
 
 	forwarder := testForwarder{}
-	apiTracker := tracker.NewAPITracker(&forwarder, testSrv.URL, hostSwitchIP, true)
+	apiTracker := tracker.NewAPITracker(&forwarder, testSrv.URL, true)
 	portMapping := nat.PortMap{
 		"80/tcp": []nat.PortBinding{
 			{
@@ -92,7 +91,7 @@ func TestAddOverride(t *testing.T) {
 	defer testSrv.Close()
 
 	forwarder := testForwarder{}
-	apiTracker := tracker.NewAPITracker(&forwarder, testSrv.URL, hostSwitchIP, true)
+	apiTracker := tracker.NewAPITracker(&forwarder, testSrv.URL, true)
 	portMapping := nat.PortMap{
 		"80/tcp": []nat.PortBinding{
 			{
@@ -184,7 +183,7 @@ func TestAddWithError(t *testing.T) {
 	defer testSrv.Close()
 
 	forwarder := testForwarder{}
-	apiTracker := tracker.NewAPITracker(&forwarder, testSrv.URL, hostSwitchIP, true)
+	apiTracker := tracker.NewAPITracker(&forwarder, testSrv.URL, true)
 	portMapping := nat.PortMap{
 		"80/tcp": []nat.PortBinding{
 			{
@@ -280,7 +279,7 @@ func TestGet(t *testing.T) {
 	defer testSrv.Close()
 
 	forwarder := testForwarder{}
-	apiTracker := tracker.NewAPITracker(&forwarder, testSrv.URL, hostSwitchIP, true)
+	apiTracker := tracker.NewAPITracker(&forwarder, testSrv.URL, true)
 	err := apiTracker.Add(containerID, portMapping)
 	require.NoError(t, err)
 
@@ -309,7 +308,7 @@ func TestRemove(t *testing.T) {
 	defer testSrv.Close()
 
 	forwarder := testForwarder{}
-	apiTracker := tracker.NewAPITracker(&forwarder, testSrv.URL, hostSwitchIP, true)
+	apiTracker := tracker.NewAPITracker(&forwarder, testSrv.URL, true)
 	portMapping1 := nat.PortMap{
 		"80/tcp": []nat.PortBinding{
 			{
@@ -374,7 +373,7 @@ func TestRemoveWithError(t *testing.T) {
 	defer testSrv.Close()
 
 	forwarder := testForwarder{}
-	apiTracker := tracker.NewAPITracker(&forwarder, testSrv.URL, hostSwitchIP, true)
+	apiTracker := tracker.NewAPITracker(&forwarder, testSrv.URL, true)
 
 	portMapping := nat.PortMap{
 		"80/tcp": []nat.PortBinding{
@@ -435,7 +434,7 @@ func TestRemoveAll(t *testing.T) {
 	defer testSrv.Close()
 
 	forwarder := testForwarder{}
-	apiTracker := tracker.NewAPITracker(&forwarder, testSrv.URL, hostSwitchIP, true)
+	apiTracker := tracker.NewAPITracker(&forwarder, testSrv.URL, true)
 
 	portMapping1 := nat.PortMap{
 		"80/tcp": []nat.PortBinding{
@@ -500,7 +499,7 @@ func TestRemoveAllWithError(t *testing.T) {
 	defer testSrv.Close()
 
 	forwarder := testForwarder{}
-	apiTracker := tracker.NewAPITracker(&forwarder, testSrv.URL, hostSwitchIP, true)
+	apiTracker := tracker.NewAPITracker(&forwarder, testSrv.URL, true)
 
 	portMapping1 := nat.PortMap{
 		"80/tcp": []nat.PortBinding{
@@ -581,7 +580,7 @@ func TestNonAdminInstall(t *testing.T) {
 	defer testSrv.Close()
 
 	forwarder := testForwarder{}
-	apiTracker := tracker.NewAPITracker(&forwarder, testSrv.URL, hostSwitchIP, false)
+	apiTracker := tracker.NewAPITracker(&forwarder, testSrv.URL, false)
 
 	portMapping := nat.PortMap{
 		"1025/tcp": []nat.PortBinding{
@@ -620,22 +619,4 @@ func TestNonAdminInstall(t *testing.T) {
 
 func ipPortBuilder(ip, port string) string {
 	return ip + ":" + port
-}
-
-type testForwarder struct {
-	receivedPortMappings []guestagentType.PortMapping
-	sendErr              error
-	failCondition        func(guestagentType.PortMapping) error
-}
-
-func (v *testForwarder) Send(portMapping guestagentType.PortMapping) error {
-	if v.failCondition != nil {
-		if err := v.failCondition(portMapping); err != nil {
-			return err
-		}
-	}
-
-	v.receivedPortMappings = append(v.receivedPortMappings, portMapping)
-
-	return v.sendErr
 }

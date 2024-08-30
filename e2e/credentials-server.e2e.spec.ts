@@ -31,8 +31,11 @@ import { expect, test } from '@playwright/test';
 import fetch from 'node-fetch';
 
 import { NavPage } from './pages/nav-page';
-import { getFullPathForTool, startSlowerDesktop, teardown, tool } from './utils/TestUtils';
+import {
+  getFullPathForTool, retry, startSlowerDesktop, teardown, tool,
+} from './utils/TestUtils';
 
+import { defaultSettings } from '@pkg/config/settings';
 import { ServerState } from '@pkg/main/commandServer/httpCommandServer';
 import { spawnFile } from '@pkg/utils/childProcess';
 import paths from '@pkg/utils/paths';
@@ -106,6 +109,7 @@ function haveCredentialServerHelper(): boolean {
 
 const describeWithCreds = haveCredentialServerHelper() ? test.describe : test.describe.skip;
 const describeCredHelpers = credStore === 'none' ? test.describe.skip : test.describe;
+const testWin32 = os.platform() === 'win32' ? test : test.skip;
 const testUnix = os.platform() === 'win32' ? test.skip : test;
 
 describeWithCreds('Credentials server', () => {
@@ -328,6 +332,32 @@ describeWithCreds('Credentials server', () => {
 
     // Don't bother trying to test erasing a nonexistent credential, because the
     // behavior is all over the place. Fails with osxkeychain, succeeds with wincred.
+  });
+
+  // On Windows, we need to wait for the vtunnel proxy to be established.
+  testWin32('ensure vtunnel proxy is ready', () => {
+    const isTunnel = defaultSettings.experimental.virtualMachine.networkingTunnel;
+
+    test.skip(isTunnel, 'vtunnel process is not needed when network tunnel is enabled');
+    const args = ['--distribution', 'rancher-desktop', '--exec',
+      'curl', '--verbose', '--user', `${ serverState.user }:${ serverState.password }`,
+      'http://localhost:3030/'];
+
+    return retry(async() => {
+      try {
+        await spawnFile('wsl.exe', args);
+      } catch (ex: any) {
+        const curlExitReason = {
+          7:  'Failed to connect to host',
+          56: 'Failure in receiving network data',
+        };
+
+        if (!curlExitReason) {
+          throw ex;
+        }
+        throw new Error(`curl failed with ${ ex } (${ curlExitReason })`);
+      }
+    });
   });
 
   test('it should complain about an unrecognized command', async() => {

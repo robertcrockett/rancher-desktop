@@ -11,6 +11,8 @@ use (
 	./src/go/nerdctl-stub
 	./src/go/nerdctl-stub/generate
 	./src/go/networking
+	./src/go/privileged-service
 	./src/go/rdctl
+	./src/go/vtunnel
 	./src/go/wsl-helper
 )
